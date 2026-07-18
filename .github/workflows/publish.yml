@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out release payload
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Validate release payload
         id: release
@@ -55,9 +55,14 @@ jobs:
             const version = manifest.version;
             const archive = `Tephra_${version}_universal.app.tar.gz`;
             const expectedUrl = `https://github.com/madebypan/tephra-releases/releases/download/v${version}/${archive}`;
+            const expectedSignature = readFileSync(`payload/${archive}.sig`, "utf8").trim();
+            const platforms = Object.keys(manifest.platforms ?? {}).sort();
+            if (platforms.join(",") !== "darwin-aarch64,darwin-x86_64") {
+              throw new Error("Updater manifest must contain exactly the two macOS architectures");
+            }
             for (const platform of ["darwin-aarch64", "darwin-x86_64"]) {
               const entry = manifest.platforms?.[platform];
-              if (entry?.url !== expectedUrl || !entry?.signature) {
+              if (entry?.url !== expectedUrl || entry?.signature !== expectedSignature) {
                 throw new Error(`Invalid updater entry: ${platform}`);
               }
             }
@@ -66,7 +71,45 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Create public GitHub release
+      - name: Prepare idempotent public release
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if ! release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null)"; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          existing="$RUNNER_TEMP/existing-release"
+          mkdir -p "$existing"
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$existing" \
+            --pattern Tephra.dmg \
+            --pattern latest.json \
+            --pattern "$ARCHIVE" \
+            --pattern "$ARCHIVE.sig"
+          for asset in Tephra.dmg latest.json "$ARCHIVE" "$ARCHIVE.sig"; do
+            if ! cmp --silent "payload/$asset" "$existing/$asset"; then
+              echo "::error::A different published asset already exists for $TAG: $asset"
+              exit 1
+            fi
+          done
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft public GitHub release
+        if: ${{ steps.existing.outputs.published != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,9 +127,9 @@ jobs:
             --target main \
             --title "Tephra $TAG" \
             --notes "Signed and notarized Tephra build for macOS 13 or newer. Download from https://tephranote.com." \
-            --latest
+            --draft
 
-      - name: Verify public assets
+      - name: Verify staged public assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -95,13 +138,36 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets --jq '
-            if .isDraft then error("release is still a draft") else . end
-            | [.assets[].name]
-            | if (index("Tephra.dmg") and index("latest.json") and index(env.ARCHIVE))
+            [.assets[].name]
+            | if (index("Tephra.dmg") and index("latest.json") and index(env.ARCHIVE) and index(env.ARCHIVE + ".sig"))
               then .
               else error("missing public release assets")
               end
           ' >/dev/null
+
+      - name: Publish verified GitHub release
+        if: ${{ steps.existing.outputs.published != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Verify anonymous public downloads
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          for asset in Tephra.dmg latest.json "$ARCHIVE" "$ARCHIVE.sig"; do
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors --retry-delay 2 --head \
+              "$base/$asset" --output /dev/null
+          done
 
       - name: Remove temporary release branch
         if: success()
