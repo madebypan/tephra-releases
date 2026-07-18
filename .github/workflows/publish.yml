@@ -1,0 +1,114 @@
+name: Publish Tephra release
+
+on:
+  push:
+    branches:
+      - "release/v*"
+
+concurrency:
+  group: tephra-public-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out release payload
+        uses: actions/checkout@v6
+
+      - name: Validate release payload
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version // empty' payload/latest.json)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::payload/latest.json has an invalid version"
+            exit 1
+          fi
+          tag="v$version"
+          if [[ "$GITHUB_REF" != "refs/heads/release/$tag" ]]; then
+            echo "::error::Release branch and manifest version do not match"
+            exit 1
+          fi
+          archive="Tephra_${version}_universal.app.tar.gz"
+          required=(
+            payload/Tephra.dmg
+            payload/latest.json
+            "payload/$archive"
+            "payload/$archive.sig"
+          )
+          for file in "${required[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "::error::Missing or empty release asset: $file"
+              exit 1
+            fi
+          done
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const manifest = JSON.parse(readFileSync("payload/latest.json", "utf8"));
+            const version = manifest.version;
+            const archive = `Tephra_${version}_universal.app.tar.gz`;
+            const expectedUrl = `https://github.com/madebypan/tephra-releases/releases/download/v${version}/${archive}`;
+            for (const platform of ["darwin-aarch64", "darwin-x86_64"]) {
+              const entry = manifest.platforms?.[platform];
+              if (entry?.url !== expectedUrl || !entry?.signature) {
+                throw new Error(`Invalid updater entry: ${platform}`);
+              }
+            }
+          '
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Create public GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            payload/Tephra.dmg \
+            payload/latest.json \
+            "payload/$ARCHIVE" \
+            "payload/$ARCHIVE.sig" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "Tephra $TAG" \
+            --notes "Signed and notarized Tephra build for macOS 13 or newer. Download from https://tephranote.com." \
+            --latest
+
+      - name: Verify public assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets --jq '
+            if .isDraft then error("release is still a draft") else . end
+            | [.assets[].name]
+            | if (index("Tephra.dmg") and index("latest.json") and index(env.ARCHIVE))
+              then .
+              else error("missing public release assets")
+              end
+          ' >/dev/null
+
+      - name: Remove temporary release branch
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF#refs/heads/}"
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch"
